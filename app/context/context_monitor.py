@@ -36,6 +36,7 @@ class ContextMonitor:
         self.on_error = on_error
         self.last_window: ForegroundWindowInfo | None = None
         self.last_triggered = False
+        self.last_event = "IDLE"
         self.last_error: Exception | None = None
         self._task: str | None = None
         self._stop_event = threading.Event()
@@ -69,12 +70,14 @@ class ContextMonitor:
                 info.window_title,
                 excluded=excluded,
             )
+            self.last_event = self.detector.last_event
             if not self.last_triggered:
                 return None
 
             snapshot = self.provider.capture(self._task, window_info=info)
         except Exception as exc:
             self.last_error = exc
+            self.last_event = "ERROR"
             if self.last_triggered:
                 self.detector.rearm_current()
                 self.last_triggered = False

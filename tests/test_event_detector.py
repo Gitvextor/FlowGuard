@@ -66,8 +66,35 @@ class EventDetectorTests(unittest.TestCase):
 
     def test_zero_debounce_triggers_immediately(self):
         detector = EventDetector(0, clock=self.clock)
-        self.assertTrue(detector.observe("Code.exe", "scheduler.py"))
-        self.assertFalse(detector.observe("Code.exe", "scheduler.py"))
+        self.assertTrue(detector.should_trigger("Code.exe", "scheduler.py"))
+        self.assertEqual(detector.last_event, "INITIAL_CONTEXT")
+        self.assertFalse(detector.should_trigger("Code.exe", "scheduler.py"))
+        self.assertEqual(detector.previous_app, "Code.exe")
+
+    def test_spec_case_1_vscode_to_edge_triggers(self):
+        detector = EventDetector(0, clock=self.clock)
+        self.assertTrue(detector.should_trigger("Code.exe", "scheduler.py"))
+        self.assertTrue(detector.should_trigger("msedge.exe", "Stack Overflow"))
+
+    def test_spec_case_2_same_edge_different_title_triggers(self):
+        detector = EventDetector(0, clock=self.clock)
+        detector.should_trigger("msedge.exe", "Stack Overflow")
+        self.assertTrue(
+            detector.should_trigger("msedge.exe", "PyTorch Documentation")
+        )
+
+    def test_spec_case_3_same_app_and_title_does_not_trigger(self):
+        detector = EventDetector(0, clock=self.clock)
+        detector.should_trigger("Code.exe", "scheduler.py")
+        self.assertFalse(detector.should_trigger("Code.exe", "scheduler.py"))
+
+    def test_spec_case_4_quick_return_before_debounce_does_not_trigger(self):
+        detector = EventDetector(1.5, clock=self.clock)
+        detector.should_trigger("Code.exe", "scheduler.py")
+        self.clock.now = 0.4
+        detector.should_trigger("msedge.exe", "Search")
+        self.clock.now = 0.8
+        self.assertFalse(detector.should_trigger("Code.exe", "scheduler.py"))
 
 
 class FakeProvider:

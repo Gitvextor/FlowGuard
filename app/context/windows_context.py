@@ -29,6 +29,53 @@ except ImportError:  # pragma: no cover - exercised on non-Windows environments.
 
 
 UNKNOWN_APP = "Unknown"
+UNKNOWN_WINDOW = "Unknown Window"
+
+
+def get_foreground_window_handle() -> int | None:
+    """Return the foreground HWND, or ``None`` when Windows cannot provide one."""
+
+    if win32gui is None:
+        return None
+    try:
+        hwnd = int(win32gui.GetForegroundWindow())
+        return hwnd or None
+    except Exception:
+        return None
+
+
+def get_window_title(hwnd: int | None) -> str:
+    """Return a safe title fallback for a native window handle."""
+
+    if not hwnd or win32gui is None:
+        return UNKNOWN_WINDOW
+    try:
+        return (win32gui.GetWindowText(hwnd) or "").strip() or UNKNOWN_WINDOW
+    except Exception:
+        return UNKNOWN_WINDOW
+
+
+def get_window_process_id(hwnd: int | None) -> int | None:
+    """Return the process ID owning ``hwnd`` without leaking Win32 errors."""
+
+    if not hwnd or win32process is None:
+        return None
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return int(pid) if pid else None
+    except Exception:
+        return None
+
+
+def get_process_name(pid: int | None) -> str:
+    """Resolve an exact PID to its executable name with a stable fallback."""
+
+    if not pid or psutil is None:
+        return UNKNOWN_APP
+    try:
+        return (psutil.Process(pid).name() or "").strip() or UNKNOWN_APP
+    except Exception:
+        return UNKNOWN_APP
 
 
 @dataclass(frozen=True)
@@ -118,9 +165,8 @@ class WindowsContextProvider(ContextProvider):
                     window_title="",
                 )
 
-            title = (win32gui.GetWindowText(hwnd) or "").strip()
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            pid = int(pid) if pid else None
+            title = get_window_title(hwnd)
+            pid = get_window_process_id(hwnd)
             app_name, process_error = self._process_name(pid)
             is_self = self._is_self_window(hwnd, pid, title)
             return ForegroundWindowInfo(
@@ -164,11 +210,10 @@ class WindowsContextProvider(ContextProvider):
         )
 
     def _process_name(self, pid: int | None) -> tuple[str, str | None]:
-        if not pid or psutil is None:
+        if not pid:
             return UNKNOWN_APP, None
         try:
-            name = (psutil.Process(pid).name() or "").strip()
-            return name or UNKNOWN_APP, None
+            return get_process_name(pid), None
         except Exception as exc:
             return UNKNOWN_APP, f"{type(exc).__name__}: {exc}"
 

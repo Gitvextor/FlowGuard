@@ -4,6 +4,10 @@ from unittest.mock import Mock, patch
 from app.context.windows_context import (
     SelfWindowExcludedError,
     WindowsContextProvider,
+    get_foreground_window_handle,
+    get_process_name,
+    get_window_process_id,
+    get_window_title,
 )
 from app.core import ContextSnapshot
 
@@ -97,6 +101,20 @@ class WindowsContextProviderTests(unittest.TestCase):
         self.assertEqual(snapshot.app_name, "msedge.exe")
         self.assertEqual(snapshot.screenshot, b"\xff\xd8demo")
         self.screenshot.capture_primary_screen.assert_called_once_with()
+
+    @patch("app.context.windows_context.psutil")
+    @patch("app.context.windows_context.win32process")
+    @patch("app.context.windows_context.win32gui")
+    def test_public_win32_helpers_have_safe_fallbacks(self, gui, process, psutil):
+        gui.GetForegroundWindow.return_value = 101
+        gui.GetWindowText.return_value = ""
+        process.GetWindowThreadProcessId.return_value = (7, 202)
+        psutil.Process.return_value.name.return_value = "Code.exe"
+
+        self.assertEqual(get_foreground_window_handle(), 101)
+        self.assertEqual(get_window_title(101), "Unknown Window")
+        self.assertEqual(get_window_process_id(101), 202)
+        self.assertEqual(get_process_name(202), "Code.exe")
 
 
 if __name__ == "__main__":
