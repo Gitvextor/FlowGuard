@@ -2,6 +2,8 @@
 
 Windows task-detour and interruption-recovery assistant. This repository currently contains the platform-independent foundation delivered by Person A.
 
+For the agreed project scope and a Feishu-ready overview, read [the final project brief](docs/FLOWGUARD_FINAL_BRIEF_FEISHU.md).
+
 ## Quick start
 
 ```powershell
