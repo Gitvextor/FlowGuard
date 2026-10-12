@@ -46,6 +46,21 @@ class FlowGuardController:
             raise RuntimeError("Start FlowGuard before processing context.")
 
         context = self.context_provider.capture(self.task)
+        return self.process_snapshot(context)
+
+    def process_snapshot(
+        self, context: ContextSnapshot
+    ) -> tuple[ContextSnapshot, ClassificationResult, ResumeAnchor]:
+        """Classify an already captured snapshot from a context monitor.
+
+        The Windows context monitor owns polling and screenshot triggers. This
+        entry point lets the UI consume its snapshots without a second capture
+        loop.
+        """
+
+        if not self.running or not self.task:
+            raise RuntimeError("Start FlowGuard before processing context.")
+
         result = self.classifier.classify(context)
         event = HistoryEvent(
             timestamp=context.timestamp,

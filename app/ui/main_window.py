@@ -1,8 +1,8 @@
 """Small Windows-first dashboard for the FlowGuard foundation.
 
-The UI intentionally consumes the stable controller and model contracts.  It
-does not perform network calls on the Qt event loop; later milestones can
-replace the mock providers without changing the presentation layer.
+The UI intentionally consumes the stable controller and model contracts. It
+lets B's ContextMonitor own polling and only receives completed snapshots on
+Qt signals; later AI/network modules can replace the classifier safely.
 """
 
 from __future__ import annotations
@@ -11,8 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -35,6 +34,7 @@ from app.controller.base_controller import (
     MockContextProvider,
     MockResumeGenerator,
 )
+from app.context import ContextMonitor, WindowsContextProvider
 from app.core.models import ActivityState, ClassificationResult, ContextSnapshot, ResumeAnchor
 from app.storage.session_store import SessionStore
 
@@ -71,11 +71,17 @@ def _card() -> QFrame:
 class FlowGuardWindow(QMainWindow):
     """Readable single-window dashboard for a declared task."""
 
+    snapshot_signal = pyqtSignal(object)
+    monitor_error_signal = pyqtSignal(object)
+
     def __init__(self, controller: FlowGuardController | None = None) -> None:
         super().__init__()
         self.setWindowTitle("FlowGuard · 任务护航")
         self.resize(1120, 760)
-        self.controller = controller or self._build_demo_controller()
+        self.live_provider = WindowsContextProvider()
+        self.live_dependency_error = self.live_provider._dependency_error()
+        self.controller = controller or self._build_controller()
+        self.monitor: ContextMonitor | None = None
         self._running = False
         self._last_event_count = 0
 
@@ -111,12 +117,13 @@ class FlowGuardWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.setInterval(1800)
         self.timer.timeout.connect(self.process_once)
+        self.snapshot_signal.connect(self._handle_snapshot)
+        self.monitor_error_signal.connect(self._handle_monitor_error)
 
         self._build_ui()
         self._apply_style()
 
-    @staticmethod
-    def _build_demo_controller() -> FlowGuardController:
+    def _build_controller(self) -> FlowGuardController:
         data_dir = Path.home() / ".flowguard" / "sessions"
         return FlowGuardController(
             MockContextProvider(),
@@ -190,7 +197,7 @@ class FlowGuardWindow(QMainWindow):
         anchor_layout.addWidget(self.anchor_next, 4, 0, 1, 2)
         root_layout.addWidget(anchor_card)
 
-        privacy = QLabel("截图仅在内存中处理；暂停后不再采集。当前界面使用 foundation mock 链路，后续可替换为 Windows Context Provider。")
+        privacy = QLabel("截图仅在内存中处理；暂停后不再采集。Windows 版本优先读取前台窗口变化，只有稳定变化后才抓取上下文。")
         privacy.setObjectName("footer")
         privacy.setWordWrap(True)
         root_layout.addWidget(privacy)
@@ -211,6 +218,9 @@ class FlowGuardWindow(QMainWindow):
     def toggle_session(self) -> None:
         if self._running:
             self.timer.stop()
+            if self.monitor is not None:
+                self.monitor.stop()
+                self.monitor = None
             self.controller.stop()
             self._running = False
             self.session_badge.setText("已暂停")
@@ -230,10 +240,28 @@ class FlowGuardWindow(QMainWindow):
         self._running = True
         self._last_event_count = 0
         self.timeline.clear()
-        self.session_badge.setText("护航中")
         self.start_button.setText("暂停")
-        self.process_once()
-        self.timer.start()
+        if self.live_dependency_error is None:
+            try:
+                self.live_provider.register_own_window(int(self.winId()), self.windowTitle())
+                self.monitor = ContextMonitor(
+                    self.live_provider,
+                    on_snapshot=lambda snapshot: self.snapshot_signal.emit(snapshot),
+                    on_error=lambda error: self.monitor_error_signal.emit(error),
+                )
+                self.monitor.start(task)
+                self.session_badge.setText("护航中 · 实时")
+            except Exception as exc:
+                self.monitor = None
+                self.session_badge.setText("护航中 · 演示")
+                self.reason_value.setText(f"实时监控未启动，已回退演示链路：{exc}")
+                self.process_once()
+                self.timer.start()
+        else:
+            self.session_badge.setText("护航中 · 演示")
+            self.reason_value.setText(f"当前环境未启用 Windows Context，使用演示链路：{self.live_dependency_error}")
+            self.process_once()
+            self.timer.start()
 
     def process_once(self) -> None:
         if not self._running:
@@ -245,6 +273,20 @@ class FlowGuardWindow(QMainWindow):
             self.reason_value.setText(f"本次采集未完成：{exc}")
             return
         self._update_state(context, result, anchor)
+
+    def _handle_snapshot(self, snapshot: ContextSnapshot) -> None:
+        if not self._running:
+            return
+        try:
+            context, result, anchor = self.controller.process_snapshot(snapshot)
+        except Exception as exc:
+            self._handle_monitor_error(exc)
+            return
+        self._update_state(context, result, anchor)
+
+    def _handle_monitor_error(self, error: Exception) -> None:
+        self.session_badge.setText("护航中 · 等待重试")
+        self.reason_value.setText(f"上下文采集暂未完成：{error}")
 
     def _update_state(self, context: ContextSnapshot, result: ClassificationResult, anchor: ResumeAnchor) -> None:
         label, color = STATE_LABELS[result.state]
@@ -292,6 +334,14 @@ class FlowGuardWindow(QMainWindow):
             QListWidget#timeline::item:selected {{ background: {COLORS['panel_2']}; }}
             """
         )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        if self.monitor is not None:
+            self.monitor.stop()
+            self.monitor = None
+        if self.controller.running:
+            self.controller.stop()
+        event.accept()
 
 
 def launch() -> int:

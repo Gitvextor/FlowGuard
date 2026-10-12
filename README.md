@@ -13,7 +13,8 @@ pip install -r requirements.txt
 python scripts/foundation_demo.py
 ```
 
-Launch the PyQt6 dashboard (the current foundation uses mock context/classifier data):
+Launch the PyQt6 dashboard. On Windows with `pywin32` and `psutil`, it uses B's
+foreground-window monitor; other environments fall back to the foundation mock chain:
 
 ```powershell
 python main.py --ui

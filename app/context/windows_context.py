@@ -231,11 +231,9 @@ class WindowsContextProvider(ContextProvider):
 
     @staticmethod
     def _dependency_error() -> str | None:
-        missing = []
-        if win32gui is None or win32process is None:
-            missing.append("pywin32")
-        if psutil is None:
-            missing.append("psutil")
-        if not missing:
-            return None
-        return f"Missing Windows context dependencies: {', '.join(missing)}"
+        # A foreground HWND and title are enough to keep the monitor alive.
+        # PID/process-name resolution is optional and already has safe
+        # fallbacks, which also keeps mocked/headless tests deterministic.
+        if win32gui is None:
+            return "Missing Windows context dependency: pywin32"
+        return None
