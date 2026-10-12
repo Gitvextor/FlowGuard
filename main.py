@@ -1,6 +1,16 @@
-"""Temporary entry point for the Foundation milestone."""
+﻿"""FlowGuard desktop entry point."""
 
-from scripts.foundation_demo import main
+import sys
+from PyQt6.QtWidgets import QApplication
+from app.ui import MainWindow
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("FlowGuard")
+    window = MainWindow()
+    window.show()
+    return app.exec()
 
 
 if __name__ == "__main__":

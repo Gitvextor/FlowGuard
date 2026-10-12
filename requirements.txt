@@ -6,3 +6,4 @@ python-dotenv>=1.0.0
 PyQt6>=6.4.0
 pywin32>=306; platform_system == "Windows"
 psutil>=5.9.0
+PyInstaller>=6.0.0
