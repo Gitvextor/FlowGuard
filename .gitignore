@@ -5,3 +5,9 @@ __pycache__/
 .env
 dist/
 build/
+
+# Generated PowerPoint previews and local source decks.
+pptx_*/
+pptx_tools/.cache/
+*.pptx
+*.pptx.inspect.ndjson
