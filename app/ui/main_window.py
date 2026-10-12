@@ -316,6 +316,7 @@ class FlowGuardWindow(QMainWindow):
         self.setStyleSheet(
             f"""
             QMainWindow, QWidget {{ background: {COLORS['canvas']}; color: {COLORS['text']}; font-family: 'Microsoft YaHei'; }}
+            QLabel {{ background: transparent; }}
             QFrame#card {{ background: {COLORS['panel']}; border: 1px solid {COLORS['line']}; border-radius: 14px; }}
             QLabel#title {{ color: {COLORS['text']}; font-size: 30px; font-weight: 700; }}
             QLabel#subtitle {{ color: {COLORS['cyan']}; font-size: 14px; }}
