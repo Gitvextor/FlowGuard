@@ -1,14 +1,13 @@
 """Small Windows-first dashboard for the FlowGuard foundation.
 
-The UI intentionally consumes the stable controller and model contracts. It
-lets B's ContextMonitor own polling and only receives completed snapshots on
-Qt signals; later AI/network modules can replace the classifier safely.
+The UI consumes the stable controller and model contracts. The context monitor
+owns polling; vision classification runs outside the Qt event loop.
 """
 
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
@@ -32,8 +31,9 @@ from app.controller.base_controller import (
     FlowGuardController,
     MockClassifier,
     MockContextProvider,
-    MockResumeGenerator,
 )
+from app.ai import HistoryResumeAnchorGenerator, LLMActivityClassifier, LLMClient
+from app.config.api_config import APISettings
 from app.context import ContextMonitor, WindowsContextProvider
 from app.core.models import ActivityState, ClassificationResult, ContextSnapshot, ResumeAnchor
 from app.storage.session_store import SessionStore
@@ -73,6 +73,9 @@ class FlowGuardWindow(QMainWindow):
 
     snapshot_signal = pyqtSignal(object)
     monitor_error_signal = pyqtSignal(object)
+    analysis_result_signal = pyqtSignal(object)
+    analysis_error_signal = pyqtSignal(object)
+    analysis_done_signal = pyqtSignal(int)
 
     def __init__(self, controller: FlowGuardController | None = None) -> None:
         super().__init__()
@@ -80,10 +83,20 @@ class FlowGuardWindow(QMainWindow):
         self.resize(1120, 760)
         self.live_provider = WindowsContextProvider()
         self.live_dependency_error = self.live_provider._dependency_error()
+        self._model_mode = "custom" if controller is not None else "demo"
+        self._model_message = ""
+        self._generation = 0
+        self._closing = False
+        self._analysis_busy = False
+        self._queued_snapshot: ContextSnapshot | None = None
+        self._analysis_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="FlowGuardAnalysis",
+        )
         self.controller = controller or self._build_controller()
         self.monitor: ContextMonitor | None = None
         self._running = False
-        self._last_event_count = 0
+        self._last_event_marker: tuple[str, str, str, str] | None = None
 
         self.task_input = QLineEdit()
         self.task_input.setPlaceholderText("先写下你现在要完成的任务，例如：完成调度实验并整理报告")
@@ -119,18 +132,39 @@ class FlowGuardWindow(QMainWindow):
         self.timer.timeout.connect(self.process_once)
         self.snapshot_signal.connect(self._handle_snapshot)
         self.monitor_error_signal.connect(self._handle_monitor_error)
+        self.analysis_result_signal.connect(self._handle_analysis_result)
+        self.analysis_error_signal.connect(self._handle_analysis_error)
+        self.analysis_done_signal.connect(self._handle_analysis_done)
 
         self._build_ui()
         self._apply_style()
 
     def _build_controller(self) -> FlowGuardController:
         data_dir = Path.home() / ".flowguard" / "sessions"
+        try:
+            settings = APISettings.from_env()
+        except (OSError, ValueError) as exc:
+            self._model_message = f"模型配置无效，当前使用演示规则：{exc}"
+            classifier = MockClassifier()
+        else:
+            if settings.is_configured:
+                self._model_mode = "ai"
+                classifier = LLMActivityClassifier(LLMClient(settings))
+            else:
+                self._model_message = "未配置模型 API Key，当前使用演示规则；配置后才会启用真实模型判断。"
+                classifier = MockClassifier()
         return FlowGuardController(
             MockContextProvider(),
-            MockClassifier(),
+            classifier,
             SessionStore(data_dir),
-            MockResumeGenerator(),
+            HistoryResumeAnchorGenerator(),
         )
+
+    def _activate_demo_mode(self, message: str) -> None:
+        if self._model_mode != "custom":
+            self.controller.classifier = MockClassifier()
+        self._model_mode = "demo"
+        self._model_message = message
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -218,11 +252,14 @@ class FlowGuardWindow(QMainWindow):
     def toggle_session(self) -> None:
         if self._running:
             self.timer.stop()
+            self._running = False
+            self._generation += 1
+            self._queued_snapshot = None
+            self.controller.stop()
             if self.monitor is not None:
                 self.monitor.stop()
                 self.monitor = None
-            self.controller.stop()
-            self._running = False
+            self.task_input.setEnabled(True)
             self.session_badge.setText("已暂停")
             self.start_button.setText("继续护航")
             return
@@ -237,9 +274,12 @@ class FlowGuardWindow(QMainWindow):
         except RuntimeError:
             self.controller.stop()
             self.controller.start(task)
+        self._generation += 1
+        self._queued_snapshot = None
         self._running = True
-        self._last_event_count = 0
+        self._last_event_marker = None
         self.timeline.clear()
+        self.task_input.setEnabled(False)
         self.start_button.setText("暂停")
         if self.live_dependency_error is None:
             try:
@@ -250,16 +290,26 @@ class FlowGuardWindow(QMainWindow):
                     on_error=lambda error: self.monitor_error_signal.emit(error),
                 )
                 self.monitor.start(task)
-                self.session_badge.setText("护航中 · 实时")
+                self.session_badge.setText(
+                    "护航中 · 实时 AI"
+                    if self._model_mode == "ai"
+                    else "护航中 · 实时上下文 / 演示判断"
+                )
+                if self._model_mode == "demo":
+                    self.reason_value.setText(self._model_message)
             except Exception as exc:
                 self.monitor = None
+                self._activate_demo_mode(f"实时监控启动失败，已回退演示模式：{exc}")
                 self.session_badge.setText("护航中 · 演示")
-                self.reason_value.setText(f"实时监控未启动，已回退演示链路：{exc}")
+                self.reason_value.setText(self._model_message)
                 self.process_once()
                 self.timer.start()
         else:
+            self._activate_demo_mode(
+                f"当前环境未启用 Windows Context，已使用演示规则：{self.live_dependency_error}"
+            )
             self.session_badge.setText("护航中 · 演示")
-            self.reason_value.setText(f"当前环境未启用 Windows Context，使用演示链路：{self.live_dependency_error}")
+            self.reason_value.setText(self._model_message)
             self.process_once()
             self.timer.start()
 
@@ -277,19 +327,66 @@ class FlowGuardWindow(QMainWindow):
     def _handle_snapshot(self, snapshot: ContextSnapshot) -> None:
         if not self._running:
             return
-        try:
-            context, result, anchor = self.controller.process_snapshot(snapshot)
-        except Exception as exc:
-            self._handle_monitor_error(exc)
+        if self._analysis_busy:
+            self._queued_snapshot = snapshot
             return
-        self._update_state(context, result, anchor)
+
+        self._analysis_busy = True
+        generation = self._generation
+        future = self._analysis_executor.submit(self.controller.process_snapshot, snapshot)
+
+        def finish_analysis(completed) -> None:
+            if self._closing:
+                return
+            try:
+                result = completed.result()
+            except Exception as exc:
+                self.analysis_error_signal.emit((generation, exc))
+            else:
+                self.analysis_result_signal.emit((generation, result))
+            finally:
+                if not self._closing:
+                    self.analysis_done_signal.emit(generation)
+
+        future.add_done_callback(finish_analysis)
+
+    def _handle_analysis_result(self, payload: object) -> None:
+        generation, result = payload
+        if generation != self._generation or not self._running:
+            return
+        context, classification, anchor = result
+        self._update_state(context, classification, anchor)
+
+    def _handle_analysis_error(self, payload: object) -> None:
+        generation, error = payload
+        if generation != self._generation or not self._running:
+            return
+        self.state_value.setText("暂不可用")
+        self.state_value.setStyleSheet(f"color: {COLORS['muted']};")
+        self.confidence_value.setText("置信度 —")
+        self.session_badge.setText("护航中 · 判断暂不可用")
+        self.reason_value.setText(f"本次处理未完成：{error}")
+
+    def _handle_analysis_done(self, generation: int) -> None:
+        self._analysis_busy = False
+        if not self._running:
+            self._queued_snapshot = None
+            return
+        snapshot = self._queued_snapshot
+        self._queued_snapshot = None
+        if snapshot is not None:
+            self._handle_snapshot(snapshot)
 
     def _handle_monitor_error(self, error: Exception) -> None:
+        if not self._running:
+            return
         self.session_badge.setText("护航中 · 等待重试")
         self.reason_value.setText(f"上下文采集暂未完成：{error}")
 
     def _update_state(self, context: ContextSnapshot, result: ClassificationResult, anchor: ResumeAnchor) -> None:
         label, color = STATE_LABELS[result.state]
+        if self._model_mode == "ai":
+            self.session_badge.setText("护航中 · 实时 AI")
         self.state_value.setText(label)
         self.state_value.setStyleSheet(f"color: {color};")
         self.confidence_value.setText(f"置信度 {result.confidence:.0%}")
@@ -300,12 +397,21 @@ class FlowGuardWindow(QMainWindow):
         self.anchor_next.setText(anchor.next_step)
 
         events = self.controller.history_store.get_recent_events(8)
-        if len(events) == self._last_event_count:
+        if not events:
             return
-        self._last_event_count = len(events)
+        latest = events[-1]
+        marker = (
+            latest.timestamp.isoformat(),
+            latest.app_name,
+            latest.window_title,
+            latest.state.value,
+        )
+        if marker == self._last_event_marker:
+            return
+        self._last_event_marker = marker
         self.timeline.clear()
         for event in reversed(events):
-            event_label, event_color = STATE_LABELS[event.state]
+            event_label, _ = STATE_LABELS[event.state]
             stamp = event.timestamp.astimezone().strftime("%H:%M:%S")
             item = QListWidgetItem(f"{stamp}   {event_label}   {event.window_title}")
             item.setForeground(Qt.GlobalColor.white)
@@ -337,11 +443,16 @@ class FlowGuardWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt callback name
+        self._closing = True
+        self._running = False
+        self._generation += 1
+        self._queued_snapshot = None
+        if self.controller.running:
+            self.controller.stop()
         if self.monitor is not None:
             self.monitor.stop()
             self.monitor = None
-        if self.controller.running:
-            self.controller.stop()
+        self._analysis_executor.shutdown(wait=False, cancel_futures=True)
         event.accept()
 
 

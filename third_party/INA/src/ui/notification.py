@@ -1,0 +1,500 @@
+import os
+import sys
+import subprocess
+import uuid
+import time
+import threading
+from pathlib import Path
+from PyQt6.QtWidgets import QSystemTrayIcon
+from PyQt6.QtCore import QTimer
+
+# --- Desktop Notifier for macOS Sequoia and beyond ---
+import asyncio
+import rumps
+from desktop_notifier import DesktopNotifier, Button
+from desktop_notifier.common import Notification
+
+# Single notifier instance for the whole module
+notifier = DesktopNotifier(app_name="Intention")
+
+
+def _find_assets_dir() -> str | None:
+    """Locate the assets directory whether running from source or py2app bundle."""
+    try:
+        # 1. Development environment: assets next to source files
+        current_dir = Path(__file__).resolve()
+        dev_assets = current_dir.parent.parent / "assets"
+        if dev_assets.exists():
+            return str(dev_assets)
+    except Exception:
+        # __file__ might represent a path inside a zip; ignore and try other fallbacks
+        pass
+
+    # 2. Py2app bundle: assets shipped inside Contents/Resources/assets
+    try:
+        # Foundation.NSBundles handles both frozen and dev modes on macOS
+        from Foundation import NSBundle  # type: ignore
+
+        bundle = NSBundle.mainBundle()
+        resource_path = bundle.resourcePath()
+        if resource_path:
+            bundle_assets = Path(resource_path) / "assets"
+            if bundle_assets.exists():
+                return str(bundle_assets)
+    except Exception:
+        pass
+
+    # 3. Frozen but without Foundation (fallback)
+    try:
+        exe_path = Path(sys.executable).resolve()
+        bundle_assets = exe_path.parent.parent / "Resources" / "assets"
+        if bundle_assets.exists():
+            return str(bundle_assets)
+    except Exception:
+        pass
+
+    return None
+
+
+def play_notification_sound(state: int):
+    """Play notification sound based on state
+
+    Args:
+        state: 0 for focused (on-task), 1 for distracted (off-task), 2 for uncertain (no sound)
+    """
+    try:
+        from ..config.api_config import get_api_config_manager
+
+        api_manager = get_api_config_manager()
+
+        # Check if sound is enabled
+        if not api_manager.get_sound_enabled():
+            print("[SOUND] Notification sound is disabled")
+            return
+
+        # No sound for uncertain state
+        if state == 2:
+            print("[SOUND] Uncertain state (0.4-0.6) - no sound played")
+            return
+
+        # Get sound file based on state
+        if state == 0:  # Focused
+            sound_file = api_manager.get_on_task_sound()
+            state_text = "FOCUSED (on-task)"
+        else:  # Distracted
+            sound_file = api_manager.get_off_task_sound()
+            state_text = "DISTRACTED (off-task)"
+
+        # Locate assets directory across dev/bundle environments
+        assets_dir = _find_assets_dir()
+
+        if not assets_dir:
+            print("[SOUND] Could not locate assets directory")
+            return
+
+        sound_path = os.path.join(assets_dir, sound_file)
+
+        if not os.path.exists(sound_path):
+            print(f"[SOUND] Sound file not found: {sound_path}")
+            return
+
+        print(f"[SOUND] Playing {state_text} sound: {sound_file}")
+
+        # Play sound in background thread using afplay (macOS native)
+        threading.Thread(
+            target=_play_sound_background, args=(sound_path,), daemon=True
+        ).start()
+
+    except Exception as e:
+        print(f"[SOUND] Error playing notification sound: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
+def _play_sound_background(sound_path: str):
+    """Play sound in background using macOS afplay command"""
+    try:
+        result = subprocess.run(
+            ["afplay", sound_path],
+            capture_output=True,
+            text=True,
+            timeout=5,  # 5 second timeout
+        )
+        if result.returncode == 0:
+            print(f"[SOUND] Successfully played: {os.path.basename(sound_path)}")
+        else:
+            print(f"[SOUND] Failed to play: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        print(f"[SOUND] Playback timeout: {os.path.basename(sound_path)}")
+    except Exception as e:
+        print(f"[SOUND] Background playback error: {e}")
+
+
+class NotificationManager:
+    def __init__(self):
+        self.last_notification_time = 0
+        self.notification_cooldown = 2  # seconds
+
+        self.setup_notification_permissions()
+
+    def setup_notification_permissions(self):
+        """Request notification permissions on macOS"""
+        try:
+            # Explicitly ask macOS for notification permission
+            try:
+                from desktop_notifier import PermissionState
+
+                async def _ask():
+                    state = await notifier.request_permission()
+                    return state
+
+                state = asyncio.run(_ask())
+                if state != PermissionState.GRANTED:
+                    print(
+                        "[WARN] Notification permission not granted. "
+                        "Open System Settings → Notifications and allow 'Python' (or your bundle name)."
+                    )
+            except ImportError as import_error:
+                print(f"[WARN] Could not import PermissionState: {import_error}")
+                print(
+                    "[INFO] Notification permissions will be handled by macOS automatically"
+                )
+                # Continue without explicit permission request - macOS will handle it
+
+        except Exception as e:
+            print(f"[ERROR] Permission request failed: {e}")
+            print("[INFO] Continuing without explicit permission request")
+
+    def is_fullscreen_active(self):
+        """Check if any window is in fullscreen mode using a more reliable method"""
+        try:
+            script = """
+            tell application "System Events"
+                set fullscreenWindow to false
+                repeat with proc in (processes whose visible is true)
+                    try
+                        if exists (window 1 of proc) then
+                            if value of attribute "AXFullScreen" of window 1 of proc is true then
+                                set fullscreenWindow to true
+                                exit repeat
+                            end if
+                        end if
+                    end try
+                end repeat
+                return fullscreenWindow
+            end tell
+            """
+            result = subprocess.run(
+                ["osascript", "-e", script], capture_output=True, text=True
+            )
+            return "true" in result.stdout.lower()
+        except Exception as e:
+            print(f"Fullscreen check error: {e}")
+            return False
+
+    @staticmethod
+    def show_notification(
+        title,
+        subtitle,
+        message,
+        state=None,
+        on_good=None,
+        on_bad=None,
+        dashboard=None,
+        notification_context=None,
+    ):
+        """Show notification using macOS notification center
+
+        Args:
+            title: Notification title
+            subtitle: Notification subtitle
+            message: Notification message
+            state: AI state (0=focused, 1=distracted)
+            on_good: Callback function for Good button click
+            on_bad: Callback function for Bad button click
+        """
+        title_with_emoji = title
+        message_with_emoji = message
+
+        try:
+            # Check if notifications are enabled
+            from ..config.api_config import get_api_config_manager
+
+            api_manager = get_api_config_manager()
+            if not api_manager.get_notification_enabled():
+                print("[NOTIFICATION] Notifications are disabled - skipping")
+                return
+
+            # Prepare emoji decorations
+            title_with_emoji = NotificationManager._add_emoji_to_title(title, state)
+            message_with_emoji = NotificationManager._add_emoji_to_message(
+                message, state
+            )
+            # Combine subtitle into the body because DesktopNotifier.send()
+            # does not have a separate 'subtitle' parameter.
+            full_message = (
+                f"Intention: {subtitle}\n{message_with_emoji}"
+                if subtitle
+                else message_with_emoji
+            )
+
+            # Play notification sound based on state
+            if state is not None:
+                play_notification_sound(state)
+
+            # Good/Bad buttons only for notification alerts with callbacks
+            buttons = []
+            # Create feedback buttons when callbacks are provided
+            if title == "Notification" and (on_good or on_bad):
+                # Generate unique ID for debugging
+                button_id = str(uuid.uuid4())[:8]
+                print("🔔" * 20)
+                print(f"📱 CREATING NOTIFICATION BUTTONS (Treatment Mode)")
+                print(f"   Title: {title}")
+                print(f"   Button ID: {button_id}")
+                print(f"   Has Good callback: {on_good is not None}")
+                print(f"   Has Bad callback: {on_bad is not None}")
+                print("🔔" * 20)
+
+                def _good():
+                    print("=" * 50)
+                    print(f"🟢 GOOD BUTTON CLICKED!")
+                    print(f"   Button ID: {button_id}")
+                    print(f"   Title: {title}")
+                    print(f"   Callback exists: {on_good is not None}")
+                    print("=" * 50)
+
+                    # 🔥 CRITICAL: Capture dashboard state at button click time for feedback handling
+                    current_context = None
+                    if dashboard:
+                        current_context = {
+                            "image_id": getattr(
+                                dashboard, "displayed_message_image_id", None
+                            )
+                            or getattr(dashboard, "last_llm_response_image_id", None),
+                            "session_id": getattr(
+                                dashboard, "current_session_start_time", "unknown"
+                            ),
+                            "task_name": getattr(
+                                dashboard, "current_task", "Unknown Task"
+                            ),
+                            "timestamp": time.time(),
+                        }
+                        print(
+                            f"[NOTIFICATION] Button click context - Image ID: {current_context['image_id']}"
+                        )
+                        print(
+                            f"[NOTIFICATION] vs Original context - Image ID: {notification_context.get('image_id', 'None') if notification_context else 'None'}"
+                        )
+
+                    # Execute original callback
+                    if on_good:
+                        try:
+                            print(f"🔄 Executing Good callback...")
+                            on_good()
+                            print(f"✅ Good callback completed successfully")
+                        except Exception as e:
+                            print(f"❌ Good callback failed: {e}")
+                            import traceback
+
+                            traceback.print_exc()
+                    else:
+                        print("⚠️  No Good callback provided")
+
+                    print(f"[NOTIFICATION] Good feedback recorded - no reason request")
+
+                def _bad():
+                    print("=" * 50)
+                    print(f"🔴 BAD BUTTON CLICKED!")
+                    print(f"   Button ID: {button_id}")
+                    print(f"   Title: {title}")
+                    print(f"   Callback exists: {on_bad is not None}")
+                    print("=" * 50)
+
+                    # 🔥 CRITICAL: Capture dashboard state at button click time for feedback handling
+                    current_context = None
+                    if dashboard:
+                        current_context = {
+                            "image_id": getattr(
+                                dashboard, "displayed_message_image_id", None
+                            )
+                            or getattr(dashboard, "last_llm_response_image_id", None),
+                            "session_id": getattr(
+                                dashboard, "current_session_start_time", "unknown"
+                            ),
+                            "task_name": getattr(
+                                dashboard, "current_task", "Unknown Task"
+                            ),
+                            "timestamp": time.time(),
+                        }
+                        print(
+                            f"[NOTIFICATION] Button click context - Image ID: {current_context['image_id']}"
+                        )
+                        print(
+                            f"[NOTIFICATION] vs Original context - Image ID: {notification_context.get('image_id', 'None') if notification_context else 'None'}"
+                        )
+
+                    # Execute original callback
+                    if on_bad:
+                        try:
+                            print(f"🔄 Executing Bad callback...")
+                            on_bad()
+                            print(f"✅ Bad callback completed successfully")
+                        except Exception as e:
+                            print(f"❌ Bad callback failed: {e}")
+                            import traceback
+
+                            traceback.print_exc()
+                    else:
+                        print("⚠️  No Bad callback provided")
+
+                    print(f"[NOTIFICATION] Bad feedback recorded - no reason request")
+
+                buttons = [
+                    Button("✅", on_pressed=_good),
+                    Button("❌", on_pressed=_bad),
+                ]
+            else:
+                buttons = []
+                if title == "Notification":
+                    print(
+                        f"[NOTIFICATION] No feedback callbacks provided - notification only"
+                    )
+
+            async def _send():
+                # Generate unique identifiers to prevent macOS from merging notifications
+                unique_id = str(uuid.uuid4())
+                timestamp = int(time.time() * 1000)  # milliseconds
+
+                # For notification alerts, make EVERYTHING unique to force separate notifications
+                if title == "Notification":
+                    # Keep title clean, only add small unique suffix
+                    unique_title = f"{title_with_emoji}"
+                    # Keep message clean without debug info
+                    unique_message = full_message
+                    unique_thread = f"{unique_id}_{timestamp}"
+
+                    success = False
+                    try:
+                        notification_obj = Notification(
+                            title=unique_title,
+                            message=unique_message,
+                            buttons=tuple(buttons),
+                            thread=unique_thread,
+                            identifier=unique_id,
+                        )
+                        await notifier.send_notification(notification_obj)
+                        success = True
+                    except Exception as send_error:
+                        print(f"[NOTIFICATION] DesktopNotifier failed: {send_error}")
+
+                    if not success:
+                        NotificationManager._fallback_rumps_notification(
+                            title_with_emoji, subtitle, unique_message
+                        )
+
+                    print("🚀" * 15)
+                    print("🚀 DISPATCHING NOTIFICATION...")
+                    print("🚀" * 15)
+                    print("📤 Notification sent via DesktopNotifier")
+                    print(f"📤 Title: {unique_title}")
+                    print(f"📤 Message preview: {unique_message[:50]}...")
+                    print(f"📤 Thread: {unique_thread}")
+                else:
+                    # For other notifications, use regular notifier
+                    await notifier.send(
+                        title=title_with_emoji,
+                        message=full_message,
+                        buttons=buttons,
+                    )
+                    print(f"[DEBUG] Regular notification sent: {title}")
+
+            # Safe asyncio handling - check if event loop is already running
+            try:
+                loop = asyncio.get_running_loop()
+                # If we're in an existing loop, schedule the coroutine
+                asyncio.ensure_future(_send())
+            except RuntimeError:
+                # No running loop, create new one
+                asyncio.run(_send())
+
+        except Exception as e:
+            print(f"[ERROR] Notification failed: {e}")
+            fallback_message = message_with_emoji
+            if subtitle:
+                fallback_message = locals().get("full_message", fallback_message)
+            NotificationManager._fallback_rumps_notification(
+                title_with_emoji, subtitle, fallback_message
+            )
+
+    @staticmethod
+    def _add_emoji_to_title(title, state):
+        if title == "Intentional Computing":
+            if state == 0:  # Focused state - use thumbs up
+                return title
+            else:  # Distracted state - use target
+                return title
+        elif title == "Intentional Computing":
+            # For reminders (always distracted state), use target emoji
+            return f"{title}"
+        else:
+            # For other notifications, keep the original format
+            return title
+
+    @staticmethod
+    def _add_emoji_to_message(message, state):
+        if state == 0:  # Focused state - use thumbs up
+            return "📢  " + message
+        else:  # Distracted state - use target
+            return "‼️  " + message
+
+    @staticmethod
+    def show_capture_success(filepath, is_cloud=False):
+        """Notification for successful capture"""
+        rumps.notification(
+            "Screen Capture",
+            "Capture & Upload Successful" if is_cloud else "Capture Successful",
+            f"Saved to {filepath}" + (" and uploaded to cloud" if is_cloud else ""),
+            sound=False,  # Disable default sound
+        )
+
+    @staticmethod
+    def show_capture_error(message="Failed to capture screen"):
+        """Notification for capture failure"""
+        rumps.notification(
+            "Screen Capture", "Error", message, sound=False
+        )  # Disable default sound
+
+    @staticmethod
+    def show_settings_update(title, subtitle, message):
+        """Notification for settings update"""
+        rumps.notification(
+            title, subtitle, message, sound=False
+        )  # Disable default sound
+
+    @staticmethod
+    def show_mode_change(mode):
+        """Notification for mode change"""
+        message = (
+            "Captures will be uploaded to cloud"
+            if mode == "Cloud"
+            else "Captures will be saved locally only"
+        )
+        rumps.notification(
+            "Mode Changed", f"Switched to {mode} Mode", message, sound=False
+        )  # Disable default sound
+
+    @staticmethod
+    def _fallback_rumps_notification(title, subtitle, message):
+        """Fallback notification using rumps when DesktopNotifier fails"""
+        try:
+            rumps.notification(
+                title,
+                subtitle or "",
+                message,
+                sound=False,
+            )
+            print("[NOTIFICATION] Fallback rumps notification delivered")
+        except Exception as e:
+            print(f"[NOTIFICATION] Fallback notification failed: {e}")

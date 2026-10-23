@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import datetime
+from threading import RLock
 
 from app.core.interfaces import ActivityClassifier, ContextProvider, ResumeAnchorGenerator
 from app.core.models import (
@@ -32,20 +33,29 @@ class FlowGuardController:
         self.on_result = on_result
         self.task: str | None = None
         self.running = False
+        self._generation = 0
+        self._state_lock = RLock()
 
     def start(self, task: str) -> str:
-        if self.running:
-            raise RuntimeError("FlowGuard is already running.")
-        self.task = task.strip()
-        session_id = self.history_store.start_session(self.task)
-        self.running = True
-        return session_id
+        normalized_task = task.strip()
+        if not normalized_task:
+            raise ValueError("A non-empty task is required to start FlowGuard.")
+        with self._state_lock:
+            if self.running:
+                raise RuntimeError("FlowGuard is already running.")
+            session_id = self.history_store.start_session(normalized_task)
+            self.task = normalized_task
+            self.running = True
+            self._generation += 1
+            return session_id
 
     def process_once(self) -> tuple[ContextSnapshot, ClassificationResult, ResumeAnchor]:
-        if not self.running or not self.task:
-            raise RuntimeError("Start FlowGuard before processing context.")
+        with self._state_lock:
+            if not self.running or not self.task:
+                raise RuntimeError("Start FlowGuard before processing context.")
+            task = self.task
 
-        context = self.context_provider.capture(self.task)
+        context = self.context_provider.capture(task)
         return self.process_snapshot(context)
 
     def process_snapshot(
@@ -58,28 +68,36 @@ class FlowGuardController:
         loop.
         """
 
-        if not self.running or not self.task:
-            raise RuntimeError("Start FlowGuard before processing context.")
-
+        with self._state_lock:
+            if not self.running or not self.task:
+                raise RuntimeError("Start FlowGuard before processing context.")
+            task = self.task
+            generation = self._generation
         result = self.classifier.classify(context)
-        event = HistoryEvent(
-            timestamp=context.timestamp,
-            app_name=context.app_name,
-            window_title=context.window_title,
-            state=result.state,
-            summary=result.task_relation or result.reason,
-        )
-        self.history_store.append_event(event)
-        anchor = self.resume_generator.generate(self.task, self.history_store.get_recent_events())
+        with self._state_lock:
+            if not self.running or generation != self._generation:
+                raise RuntimeError("Discarded a result from a stopped or replaced session.")
+            event = HistoryEvent(
+                timestamp=context.timestamp,
+                app_name=context.app_name,
+                window_title=context.window_title,
+                state=result.state,
+                summary=result.task_relation or result.reason,
+            )
+            self.history_store.append_event(event)
+            history = self.history_store.get_recent_events()
+        anchor = self.resume_generator.generate(task, history)
         if self.on_result:
             self.on_result(context, result, anchor)
         return context, result, anchor
 
     def stop(self) -> None:
-        if self.running:
-            self.history_store.end_session()
-        self.running = False
-        self.task = None
+        with self._state_lock:
+            if self.running:
+                self.history_store.end_session()
+                self._generation += 1
+            self.running = False
+            self.task = None
 
 
 class MockContextProvider:
@@ -98,14 +116,19 @@ class MockClassifier:
         title = context.window_title.lower()
         if "stackoverflow" in title or "documentation" in title:
             state = ActivityState.NECESSARY_DETOUR
-            relation = "Looking up information needed for the task."
+            relation = "演示规则命中资料检索关键词；结果仅用于展示。"
         elif "bilibili" in title or "entertainment" in title:
             state = ActivityState.DISTRACTION
-            relation = "This activity is unrelated to the declared task."
+            relation = "演示规则命中娱乐关键词；结果仅用于展示。"
         else:
             state = ActivityState.MAIN_TASK
-            relation = "Directly progressing the declared task."
-        return ClassificationResult(state=state, confidence=1.0, reason="Mock classification.", task_relation=relation)
+            relation = "未命中演示关键词；这不能证明行为与任务相关。"
+        return ClassificationResult(
+            state=state,
+            confidence=0.4,
+            reason="演示规则判断；未调用视觉模型。",
+            task_relation=relation,
+        )
 
 
 class MockResumeGenerator:

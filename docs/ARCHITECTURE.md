@@ -21,7 +21,8 @@ ContextProvider -> ActivityClassifier -> SessionStore -> ResumeAnchorGenerator -
 | `app/storage` | A | JSON session lifecycle |
 | `app/capture` | A | Primary-screen JPEG bytes |
 | `app/context` | B | Windows foreground context and event trigger |
-| `app/ai/{classifier,resume_anchor}` | C | Three-way result and truthful resume anchor |
+| `app/ai/activity_classifier.py` | C | Vision-based three-state result using the configured provider |
+| `app/ai/resume_anchor.py` | C | Evidence-based resume anchor from recent history |
 | `app/ui`, notifications, integration | D | PyQt UI and Windows delivery |
 
 ## Public contracts
@@ -34,3 +35,6 @@ LLMClient.analyze(image: bytes, prompt: str, context: dict | None = None) -> dic
 ```
 
 Do not redefine schemas or write screenshots to session storage.
+
+The UI dispatches classification away from the Qt event loop. Results from a
+stopped or replaced session are discarded before they can enter session history.
