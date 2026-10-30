@@ -14,6 +14,31 @@ Original prompts, methods, tutorials, and documentation in this repository are l
 
 ## Boundaries
 
-Only original project code and documentation owned by Gitvextor and contributors are covered. Third-party dependencies and files carrying separate terms remain under their original terms.
+The PolyForm and CC BY-NC grants above apply only to original material for which Gitvextor and the consenting contributors hold relicensing rights. Intent Assistant-derived material and the previously MIT-licensed FlowGuard foundation remain available under the MIT terms below. Other third-party components retain their own terms.
 
 Previously distributed versions may remain available under their earlier license terms; this change does not revoke rights already granted for those versions.
+
+## Preserved MIT terms for existing components
+
+MIT License
+
+Copyright (c) 2026 FlowGuard Contributors
+Copyright (c) 2025 Intent Assistant Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
